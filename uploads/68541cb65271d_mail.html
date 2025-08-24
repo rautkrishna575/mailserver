@@ -1,0 +1,1206 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-white">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Email Application</title>
+    <base target="_self">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@preline/preline@2.0.0/dist/preline.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <style>
+        .file-upload {
+            transition: all 0.3s ease;
+        }
+        .file-upload.drag-over {
+            border-color: #6366f1;
+            background-color: #eef2ff;
+        }
+        .email-item.unread {
+            background-color: #eff6ff;
+        }
+        .email-item.unread .email-subject {
+            font-weight: 600;
+            color: #1f2937;
+        }
+    </style>
+</head>
+<body class="h-full">
+    <?php
+    // Database configuration
+    $db_host = 'localhost';
+    $db_name = 'email_app';
+    $db_user = 'root';
+    $db_pass = '';
+
+    // Create database connection
+    try {
+        $pdo = new PDO("mysql:host=$db_host;dbname=$db_name", $db_user, $db_pass);
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    } catch (PDOException $e) {
+        die("Database connection failed: " . $e->getMessage());
+    }
+
+    // Helper functions
+    function sanitizeInput($data) {
+        return htmlspecialchars(strip_tags(trim($data)));
+    }
+
+    function generateToken() {
+        return bin2hex(random_bytes(32));
+    }
+
+    function verifyToken($pdo, $userId, $token) {
+        $stmt = $pdo->prepare("SELECT token FROM users WHERE id = ?");
+        $stmt->execute([$userId]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        return $user && $user['token'] === $token;
+    }
+
+    // Handle API requests
+    if (isset($_GET['api'])) {
+        session_start();
+        header('Content-Type: application/json');
+        
+        $response = ['success' => false, 'message' => ''];
+
+        try {
+            switch ($_GET['api']) {
+                case 'login':
+                    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+                        $email = sanitizeInput($_POST['email']);
+                        $password = sanitizeInput($_POST['password']);
+                        
+                        $stmt = $pdo->prepare("SELECT * FROM users WHERE email = ?");
+                        $stmt->execute([$email]);
+                        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+                        
+                        if ($user && password_verify($password, $user['password'])) {
+                            $token = generateToken();
+                            
+                            $stmt = $pdo->prepare("UPDATE users SET token = ? WHERE id = ?");
+                            $stmt->execute([$token, $user['id']]);
+                            
+                            $_SESSION['user_id'] = $user['id'];
+                            $_SESSION['token'] = $token;
+                            
+                            $response = [
+                                'success' => true,
+                                'user' => [
+                                    'id' => $user['id'],
+                                    'name' => $user['name'],
+                                    'email' => $user['email']
+                                ],
+                                'token' => $token
+                            ];
+                        } else {
+                            $response['message'] = 'Invalid email or password';
+                        }
+                    }
+                    break;
+                    
+                case 'signup':
+                    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+                        $name = sanitizeInput($_POST['name']);
+                        $email = sanitizeInput($_POST['email']);
+                        $password = password_hash(sanitizeInput($_POST['password']), PASSWORD_BCRYPT);
+                        
+                        $stmt = $pdo->prepare("SELECT id FROM users WHERE email = ?");
+                        $stmt->execute([$email]);
+                        
+                        if ($stmt->rowCount() > 0) {
+                            $response['message'] = 'Email already registered';
+                        } else {
+                            $token = generateToken();
+                            $stmt = $pdo->prepare("INSERT INTO users (name, email, password, token) VALUES (?, ?, ?, ?)");
+                            $stmt->execute([$name, $email, $password, $token]);
+                            
+                            $userId = $pdo->lastInsertId();
+                            $_SESSION['user_id'] = $userId;
+                            $_SESSION['token'] = $token;
+                            
+                            $response = [
+                                'success' => true,
+                                'user' => [
+                                    'id' => $userId,
+                                    'name' => $name,
+                                    'email' => $email
+                                ],
+                                'token' => $token
+                            ];
+                        }
+                    }
+                    break;
+                    
+                case 'emails':
+                    if (!isset($_SESSION['user_id']) || !isset($_SESSION['token']) || 
+                        !verifyToken($pdo, $_SESSION['user_id'], $_SESSION['token'])) {
+                        $response['message'] = 'Unauthorized';
+                        http_response_code(401);
+                        break;
+                    }
+                    
+                    $userId = $_SESSION['user_id'];
+                    
+                    if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+                        $folder = $_GET['folder'] ?? 'inbox';
+                        
+                        switch ($folder) {
+                            case 'inbox':
+                                $stmt = $pdo->prepare("SELECT e.*, u.name as from_name FROM emails e JOIN users u ON e.sender_id = u.id WHERE e.recipient_id = ? AND e.folder = 'inbox' ORDER BY e.created_at DESC");
+                                $stmt->execute([$userId]);
+                                break;
+                            case 'sent':
+                                $stmt = $pdo->prepare("SELECT e.*, u.name as to_name FROM emails e JOIN users u ON e.recipient_id = u.id WHERE e.sender_id = ? AND e.folder = 'sent' ORDER BY e.created_at DESC");
+                                $stmt->execute([$userId]);
+                                break;
+                            case 'drafts':
+                                $stmt = $pdo->prepare("SELECT e.* FROM emails e WHERE e.sender_id = ? AND e.folder = 'drafts' ORDER BY e.created_at DESC");
+                                $stmt->execute([$userId]);
+                                break;
+                            case 'trash':
+                                $stmt = $pdo->prepare("SELECT e.*, 
+                                    CASE WHEN e.sender_id = ? THEN u2.name ELSE u1.name END as from_name,
+                                    CASE WHEN e.sender_id = ? THEN u2.email ELSE u1.email END as from_email
+                                    FROM emails e 
+                                    LEFT JOIN users u1 ON e.sender_id = u1.id 
+                                    LEFT JOIN users u2 ON e.recipient_id = u2.id 
+                                    WHERE (e.sender_id = ? OR e.recipient_id = ?) AND e.folder = 'trash' 
+                                    ORDER BY e.created_at DESC");
+                                $stmt->execute([$userId, $userId, $userId, $userId]);
+                                break;
+                            default:
+                                $stmt = $pdo->prepare("SELECT e.*, u.name as from_name FROM emails e JOIN users u ON e.sender_id = u.id WHERE e.recipient_id = ? AND e.folder = 'inbox' ORDER BY e.created_at DESC");
+                                $stmt->execute([$userId]);
+                        }
+                        
+                        $emails = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                        
+                        // Get attachments for each email
+                        foreach ($emails as &$email) {
+                            $stmt = $pdo->prepare("SELECT * FROM attachments WHERE email_id = ?");
+                            $stmt->execute([$email['id']]);
+                            $email['attachments'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                        }
+                        
+                        $response = ['success' => true, 'emails' => $emails];
+                    } 
+                    elseif ($_SERVER['REQUEST_METHOD'] === 'POST') {
+                        $action = $_POST['action'] ?? '';
+                        
+                        if ($action === 'send') {
+                            $to = sanitizeInput($_POST['to']);
+                            $subject = sanitizeInput($_POST['subject']);
+                            $content = sanitizeInput($_POST['content']);
+                            $cc = isset($_POST['cc']) ? sanitizeInput($_POST['cc']) : null;
+                            $bcc = isset($_POST['bcc']) ? sanitizeInput($_POST['bcc']) : null;
+                            
+                            // Get recipient ID
+                            $stmt = $pdo->prepare("SELECT id FROM users WHERE email = ?");
+                            $stmt->execute([$to]);
+                            $recipient = $stmt->fetch(PDO::FETCH_ASSOC);
+                            
+                            if (!$recipient) {
+                                $response['message'] = 'Recipient not found';
+                            } else {
+                                // Save email to sent folder
+                                $stmt = $pdo->prepare("INSERT INTO emails (sender_id, recipient_id, subject, content, cc, bcc, folder) VALUES (?, ?, ?, ?, ?, ?, 'sent')");
+                                $stmt->execute([$userId, $recipient['id'], $subject, $content, $cc, $bcc]);
+                                $emailId = $pdo->lastInsertId();
+                                
+                                // Save to recipient's inbox
+                                $stmt = $pdo->prepare("INSERT INTO emails (sender_id, recipient_id, subject, content, cc, bcc, folder) VALUES (?, ?, ?, ?, ?, ?, 'inbox')");
+                                $stmt->execute([$userId, $recipient['id'], $subject, $content, $cc, $bcc]);
+                                $inboxEmailId = $pdo->lastInsertId();
+                                
+                                // Handle file uploads
+                                if (!empty($_FILES['attachments'])) {
+                                    $uploadDir = 'uploads/';
+                                    if (!file_exists($uploadDir)) {
+                                        mkdir($uploadDir, 0777, true);
+                                    }
+                                    
+                                    foreach ($_FILES['attachments']['tmp_name'] as $key => $tmpName) {
+                                        $fileName = basename($_FILES['attachments']['name'][$key]);
+                                        $filePath = $uploadDir . uniqid() . '_' . $fileName;
+                                        $fileSize = $_FILES['attachments']['size'][$key];
+                                        $fileType = $_FILES['attachments']['type'][$key];
+                                        
+                                        if (move_uploaded_file($tmpName, $filePath)) {
+                                            // Save attachment for sent email
+                                            $stmt = $pdo->prepare("INSERT INTO attachments (email_id, file_name, file_path, file_size, file_type) VALUES (?, ?, ?, ?, ?)");
+                                            $stmt->execute([$emailId, $fileName, $filePath, $fileSize, $fileType]);
+                                            
+                                            // Save attachment for inbox email
+                                            $stmt = $pdo->prepare("INSERT INTO attachments (email_id, file_name, file_path, file_size, file_type) VALUES (?, ?, ?, ?, ?)");
+                                            $stmt->execute([$inboxEmailId, $fileName, $filePath, $fileSize, $fileType]);
+                                        }
+                                    }
+                                }
+                                
+                                $response = ['success' => true];
+                            }
+                        }
+                        elseif ($action === 'save_draft') {
+                            $to = isset($_POST['to']) ? sanitizeInput($_POST['to']) : null;
+                            $subject = isset($_POST['subject']) ? sanitizeInput($_POST['subject']) : null;
+                            $content = isset($_POST['content']) ? sanitizeInput($_POST['content']) : null;
+                            
+                            $recipientId = null;
+                            if ($to) {
+                                $stmt = $pdo->prepare("SELECT id FROM users WHERE email = ?");
+                                $stmt->execute([$to]);
+                                $recipient = $stmt->fetch(PDO::FETCH_ASSOC);
+                                $recipientId = $recipient ? $recipient['id'] : null;
+                            }
+                            
+                            $stmt = $pdo->prepare("INSERT INTO emails (sender_id, recipient_id, subject, content, folder) VALUES (?, ?, ?, ?, 'drafts')");
+                            $stmt->execute([$userId, $recipientId, $subject, $content]);
+                            $emailId = $pdo->lastInsertId();
+                            
+                            // Handle file uploads for drafts
+                            if (!empty($_FILES['attachments'])) {
+                                $uploadDir = 'uploads/';
+                                if (!file_exists($uploadDir)) {
+                                    mkdir($uploadDir, 0777, true);
+                                }
+                                
+                                foreach ($_FILES['attachments']['tmp_name'] as $key => $tmpName) {
+                                    $fileName = basename($_FILES['attachments']['name'][$key]);
+                                    $filePath = $uploadDir . uniqid() . '_' . $fileName;
+                                    $fileSize = $_FILES['attachments']['size'][$key];
+                                    $fileType = $_FILES['attachments']['type'][$key];
+                                    
+                                    if (move_uploaded_file($tmpName, $filePath)) {
+                                        $stmt = $pdo->prepare("INSERT INTO attachments (email_id, file_name, file_path, file_size, file_type) VALUES (?, ?, ?, ?, ?)");
+                                        $stmt->execute([$emailId, $fileName, $filePath, $fileSize, $fileType]);
+                                    }
+                                }
+                            }
+                            
+                            $response = ['success' => true];
+                        }
+                        elseif ($action === 'delete') {
+                            $emailId = sanitizeInput($_POST['email_id']);
+                            
+                            // Move to trash instead of deleting
+                            $stmt = $pdo->prepare("UPDATE emails SET folder = 'trash' WHERE id = ? AND (sender_id = ? OR recipient_id = ?)");
+                            $stmt->execute([$emailId, $userId, $userId]);
+                            
+                            $response = ['success' => true];
+                        }
+                        elseif ($action === 'mark_read') {
+                            $emailId = sanitizeInput($_POST['email_id']);
+                            
+                            $stmt = $pdo->prepare("UPDATE emails SET is_read = TRUE WHERE id = ? AND recipient_id = ?");
+                            $stmt->execute([$emailId, $userId]);
+                            
+                            $response = ['success' => true];
+                        }
+                    }
+                    break;
+                    
+                case 'logout':
+                    if (isset($_SESSION['user_id']) && isset($_SESSION['token'])) {
+                        $stmt = $pdo->prepare("UPDATE users SET token = NULL WHERE id = ?");
+                        $stmt->execute([$_SESSION['user_id']]);
+                    }
+                    session_destroy();
+                    $response = ['success' => true];
+                    break;
+            }
+        } catch (PDOException $e) {
+            $response['message'] = 'Database error: ' . $e->getMessage();
+        }
+        
+        echo json_encode($response);
+        exit;
+    }
+
+    // Check if user is logged in
+    session_start();
+    $loggedIn = false;
+    $currentUser = null;
+
+    if (isset($_SESSION['user_id']) && isset($_SESSION['token'])) {
+        $userId = $_SESSION['user_id'];
+        $token = $_SESSION['token'];
+        
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE id = ? AND token = ?");
+        $stmt->execute([$userId, $token]);
+        $currentUser = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($currentUser) {
+            $loggedIn = true;
+            
+            // Get unread count for inbox
+            $stmt = $pdo->prepare("SELECT COUNT(*) as unread_count FROM emails WHERE recipient_id = ? AND folder = 'inbox' AND is_read = FALSE");
+            $stmt->execute([$userId]);
+            $unreadCount = $stmt->fetch(PDO::FETCH_ASSOC)['unread_count'];
+            
+            // Get drafts count
+            $stmt = $pdo->prepare("SELECT COUNT(*) as drafts_count FROM emails WHERE sender_id = ? AND folder = 'drafts'");
+            $stmt->execute([$userId]);
+            $draftsCount = $stmt->fetch(PDO::FETCH_ASSOC)['drafts_count'];
+        } else {
+            session_destroy();
+        }
+    }
+    ?>
+
+    <!-- Login/Signup Container (shown if not logged in) -->
+    <div id="auth-container" class="min-h-full flex items-center justify-center py-12 px-4 sm:px-6 lg:px-8" <?php if ($loggedIn) echo 'style="display: none;"'; ?>>
+        <div class="max-w-md w-full space-y-8">
+            <div>
+                <img class="mx-auto h-12 w-auto" src="https://tailwindui.com/img/logos/workflow-mark-indigo-600.svg" alt="Workflow">
+                <h2 class="mt-6 text-center text-3xl font-extrabold text-gray-900" id="auth-title">
+                    Sign in to your account
+                </h2>
+                <p class="mt-2 text-center text-sm text-gray-600">
+                    Or
+                    <a href="#" onclick="toggleAuthForm()" class="font-medium text-indigo-600 hover:text-indigo-500" id="auth-toggle-link">
+                        create a new account
+                    </a>
+                </p>
+            </div>
+            <form class="mt-8 space-y-6" id="auth-form">
+                <input type="hidden" name="action" id="auth-action" value="login">
+                <div class="rounded-md shadow-sm -space-y-px">
+                    <div id="name-field" class="hidden">
+                        <label for="name" class="sr-only">Full Name</label>
+                        <input id="name" name="name" type="text" autocomplete="name" class="appearance-none rounded-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-t-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 focus:z-10 sm:text-sm" placeholder="Full Name">
+                    </div>
+                    <div>
+                        <label for="email" class="sr-only">Email address</label>
+                        <input id="email" name="email" type="email" autocomplete="email" required class="appearance-none rounded-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 focus:z-10 sm:text-sm" placeholder="Email address">
+                    </div>
+                    <div>
+                        <label for="password" class="sr-only">Password</label>
+                        <input id="password" name="password" type="password" autocomplete="current-password" required class="appearance-none rounded-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-b-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 focus:z-10 sm:text-sm" placeholder="Password">
+                    </div>
+                </div>
+
+                <div class="flex items-center justify-between">
+                    <div class="flex items-center">
+                        <input id="remember-me" name="remember-me" type="checkbox" class="h-4 w-4 text-indigo-600 focus:ring-indigo-500 border-gray-300 rounded">
+                        <label for="remember-me" class="ml-2 block text-sm text-gray-900">
+                            Remember me
+                        </label>
+                    </div>
+
+                    <div class="text-sm">
+                        <a href="#" class="font-medium text-indigo-600 hover:text-indigo-500">
+                            Forgot your password?
+                        </a>
+                    </div>
+                </div>
+
+                <div>
+                    <button type="submit" class="group relative w-full flex justify-center py-2 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                        <span class="absolute left-0 inset-y-0 flex items-center pl-3">
+                            <i class="fas fa-sign-in-alt"></i>
+                        </span>
+                        <span id="auth-submit-text">Sign in</span>
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Email Application Container (shown if logged in) -->
+    <div id="app-container" class="hidden" <?php if ($loggedIn) echo 'style="display: block;"'; ?>>
+        <div class="min-h-full">
+            <nav class="bg-gray-800">
+                <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+                    <div class="flex h-16 items-center justify-between">
+                        <div class="flex items-center">
+                            <div class="flex-shrink-0">
+                                <img class="h-8 w-8" src="https://tailwindui.com/img/logos/mark.svg?color=indigo&shade=500" alt="Your Company">
+                            </div>
+                            <div class="hidden md:block">
+                                <div class="ml-10 flex items-baseline space-x-4">
+                                    <a href="#" class="bg-gray-900 text-white rounded-md px-3 py-2 text-sm font-medium" aria-current="page" onclick="loadInbox()">Inbox</a>
+                                    <a href="#" class="text-gray-300 hover:bg-gray-700 hover:text-white rounded-md px-3 py-2 text-sm font-medium" onclick="loadSent()">Sent</a>
+                                    <a href="#" class="text-gray-300 hover:bg-gray-700 hover:text-white rounded-md px-3 py-2 text-sm font-medium" onclick="loadDrafts()">Drafts</a>
+                                    <a href="#" class="text-gray-300 hover:bg-gray-700 hover:text-white rounded-md px-3 py-2 text-sm font-medium" onclick="showComposeModal()">Compose</a>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="hidden md:block">
+                            <div class="ml-4 flex items-center md:ml-6">
+                                <div class="relative ml-3">
+                                    <div>
+                                        <button type="button" class="relative flex max-w-xs items-center rounded-full bg-gray-800 text-sm focus:outline-none focus:ring-2 focus:ring-white focus:ring-offset-2 focus:ring-offset-gray-800" id="user-menu-button" aria-expanded="false" aria-haspopup="true">
+                                            <span class="absolute -inset-1.5"></span>
+                                            <span class="sr-only">Open user menu</span>
+                                            <img class="h-8 w-8 rounded-full" id="user-avatar" src="<?php echo $currentUser ? 'https://ui-avatars.com/api/?name=' . urlencode($currentUser['name']) . '&background=random' : ''; ?>" alt="">
+                                        </button>
+                                    </div>
+                                    <div class="hidden origin-top-right absolute right-0 mt-2 w-48 rounded-md shadow-lg py-1 bg-white ring-1 ring-black ring-opacity-5 focus:outline-none" role="menu" aria-orientation="vertical" aria-labelledby="user-menu-button" tabindex="-1">
+                                        <a href="#" class="block px-4 py-2 text-sm text-gray-700" role="menuitem" tabindex="-1" id="user-menu-item-0">Your Profile</a>
+                                        <a href="#" class="block px-4 py-2 text-sm text-gray-700" role="menuitem" tabindex="-1" id="user-menu-item-1">Settings</a>
+                                        <a href="#" class="block px-4 py-2 text-sm text-gray-700" role="menuitem" tabindex="-1" id="user-menu-item-2" onclick="logout()">Sign out</a>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </nav>
+
+            <div class="py-10">
+                <div class="mx-auto max-w-7xl sm:px-6 lg:px-8">
+                    <div class="px-4 py-6 sm:px-0">
+                        <div class="flex h-[calc(100vh-180px)] rounded-lg border-4 border-dashed border-gray-200">
+                            <!-- Sidebar -->
+                            <div class="w-64 border-r border-gray-200 bg-gray-50">
+                                <div class="p-4">
+                                    <button onclick="showComposeModal()" class="w-full flex items-center justify-center rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600">
+                                        <i class="fas fa-pen mr-2"></i> Compose
+                                    </button>
+                                </div>
+                                <nav class="space-y-1 px-2">
+                                    <a href="#" onclick="loadInbox()" class="bg-gray-200 text-gray-900 group flex items-center px-2 py-2 text-sm font-medium rounded-md">
+                                        <i class="fas fa-inbox mr-3 text-gray-500"></i>
+                                        Inbox
+                                        <span id="inbox-count" class="ml-auto inline-block py-0.5 px-3 text-xs font-medium bg-indigo-600 text-white rounded-full"><?php echo $loggedIn ? $unreadCount : ''; ?></span>
+                                    </a>
+                                    <a href="#" onclick="loadSent()" class="text-gray-600 hover:bg-gray-200 hover:text-gray-900 group flex items-center px-2 py-2 text-sm font-medium rounded-md">
+                                        <i class="fas fa-paper-plane mr-3 text-gray-500"></i>
+                                        Sent
+                                    </a>
+                                    <a href="#" onclick="loadDrafts()" class="text-gray-600 hover:bg-gray-200 hover:text-gray-900 group flex items-center px-2 py-2 text-sm font-medium rounded-md">
+                                        <i class="fas fa-file-alt mr-3 text-gray-500"></i>
+                                        Drafts
+                                        <span id="drafts-count" class="ml-auto inline-block py-0.5 px-3 text-xs font-medium bg-gray-300 text-gray-800 rounded-full"><?php echo $loggedIn ? $draftsCount : ''; ?></span>
+                                    </a>
+                                    <a href="#" onclick="loadTrash()" class="text-gray-600 hover:bg-gray-200 hover:text-gray-900 group flex items-center px-2 py-2 text-sm font-medium rounded-md">
+                                        <i class="fas fa-trash-alt mr-3 text-gray-500"></i>
+                                        Trash
+                                    </a>
+                                </nav>
+                            </div>
+
+                            <!-- Main content -->
+                            <div class="flex-1 flex flex-col overflow-hidden">
+                                <!-- Email list -->
+                                <div class="flex-1 overflow-y-auto">
+                                    <div class="border-b border-gray-200">
+                                        <div class="flex items-center justify-between px-4 py-2 border-b border-gray-200">
+                                            <div class="flex items-center space-x-4">
+                                                <input type="checkbox" class="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-600">
+                                                <button class="text-gray-500 hover:text-gray-700">
+                                                    <i class="fas fa-redo"></i>
+                                                </button>
+                                                <button class="text-gray-500 hover:text-gray-700">
+                                                    <i class="fas fa-ellipsis-v"></i>
+                                                </button>
+                                            </div>
+                                            <div class="flex items-center space-x-4">
+                                                <span id="folder-name" class="text-sm font-medium text-gray-500">Inbox</span>
+                                                <div class="text-xs text-gray-500">
+                                                    <span id="email-count">0</span> of <span id="total-emails">0</span>
+                                                </div>
+                                                <button class="text-gray-500 hover:text-gray-700">
+                                                    <i class="fas fa-chevron-left"></i>
+                                                </button>
+                                                <button class="text-gray-500 hover:text-gray-700">
+                                                    <i class="fas fa-chevron-right"></i>
+                                                </button>
+                                            </div>
+                                        </div>
+                                        <div id="email-list" class="divide-y divide-gray-200">
+                                            <!-- Emails will be loaded here -->
+                                            <div class="p-8 text-center text-gray-500">
+                                                <i class="fas fa-inbox text-4xl mb-2"></i>
+                                                <p>No emails to display</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Email view -->
+                                <div id="email-view" class="hidden flex-1 overflow-y-auto p-4">
+                                    <div class="bg-white rounded-lg shadow-sm p-6">
+                                        <div class="flex justify-between items-start mb-4">
+                                            <h2 id="email-subject" class="text-xl font-bold text-gray-900">Email Subject</h2>
+                                            <div class="flex space-x-2">
+                                                <button onclick="replyEmail()" class="text-gray-500 hover:text-gray-700" title="Reply">
+                                                    <i class="fas fa-reply"></i>
+                                                </button>
+                                                <button onclick="forwardEmail()" class="text-gray-500 hover:text-gray-700" title="Forward">
+                                                    <i class="fas fa-share"></i>
+                                                </button>
+                                                <button onclick="deleteEmail()" class="text-gray-500 hover:text-gray-700" title="Delete">
+                                                    <i class="fas fa-trash-alt"></i>
+                                                </button>
+                                            </div>
+                                        </div>
+                                        <div class="flex items-center mb-4">
+                                            <img id="sender-avatar" class="h-10 w-10 rounded-full" src="https://ui-avatars.com/api/?name=John+Doe&background=random" alt="">
+                                            <div class="ml-3">
+                                                <p id="sender-name" class="text-sm font-medium text-gray-900">Sender Name</p>
+                                                <p id="sender-email" class="text-sm text-gray-500">sender@example.com</p>
+                                            </div>
+                                            <div class="ml-auto text-sm text-gray-500">
+                                                <span id="email-date">May 5, 2023</span>
+                                            </div>
+                                        </div>
+                                        <div class="mb-4">
+                                            <p id="email-to" class="text-sm text-gray-500">To: me@example.com</p>
+                                            <p id="email-cc" class="text-sm text-gray-500 hidden">Cc: cc@example.com</p>
+                                        </div>
+                                        <div id="email-body" class="prose max-w-none text-gray-700">
+                                            Email content will be displayed here.
+                                        </div>
+                                        <div id="email-attachments" class="mt-6 border-t border-gray-200 pt-4 hidden">
+                                            <h3 class="text-sm font-medium text-gray-900">Attachments</h3>
+                                            <ul id="attachments-list" class="mt-2 divide-y divide-gray-200">
+                                                <!-- Attachments will be listed here -->
+                                            </ul>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Compose Email Modal -->
+        <div id="compose-modal" class="hs-overlay hidden size-full fixed top-0 start-0 z-[80] overflow-x-hidden overflow-y-auto">
+            <div class="hs-overlay-open:mt-7 hs-overlay-open:opacity-100 hs-overlay-open:duration-500 mt-0 opacity-0 ease-out transition-all sm:max-w-lg sm:w-full m-3 sm:mx-auto">
+                <div class="flex flex-col bg-white border shadow-sm rounded-xl">
+                    <div class="flex justify-between items-center py-3 px-4 border-b">
+                        <h3 class="font-bold text-gray-800">New Message</h3>
+                        <button type="button" onclick="hideComposeModal()" class="flex justify-center items-center size-7 text-sm font-semibold rounded-full border border-transparent text-gray-800 hover:bg-gray-100 disabled:opacity-50 disabled:pointer-events-none">
+                            <span class="sr-only">Close</span>
+                            <svg class="flex-shrink-0 size-4" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M18 6 6 18"/>
+                                <path d="m6 6 12 12"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <div class="p-4 overflow-y-auto">
+                        <form id="compose-form" enctype="multipart/form-data">
+                            <input type="hidden" name="action" value="send">
+                            <div class="mb-4">
+                                <label for="to" class="block text-sm font-medium text-gray-700 mb-1">To</label>
+                                <input type="text" id="to" name="to" class="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm" placeholder="recipient@example.com">
+                            </div>
+                            <div id="cc-bcc-section" class="mb-4">
+                                <div class="flex justify-between mb-1">
+                                    <button type="button" onclick="toggleCc()" class="text-xs text-indigo-600 hover:text-indigo-800">Cc</button>
+                                    <button type="button" onclick="toggleBcc()" class="text-xs text-indigo-600 hover:text-indigo-800">Bcc</button>
+                                </div>
+                                <div id="cc-field" class="hidden mb-2">
+                                    <input type="text" id="cc" name="cc" class="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm" placeholder="cc@example.com">
+                                </div>
+                                <div id="bcc-field" class="hidden">
+                                    <input type="text" id="bcc" name="bcc" class="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm" placeholder="bcc@example.com">
+                                </div>
+                            </div>
+                            <div class="mb-4">
+                                <label for="subject" class="block text-sm font-medium text-gray-700 mb-1">Subject</label>
+                                <input type="text" id="subject" name="subject" class="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm" placeholder="Subject">
+                            </div>
+                            <div class="mb-4">
+                                <textarea id="email-content" name="content" rows="10" class="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm" placeholder="Write your email here..."></textarea>
+                            </div>
+                            <div class="mb-4">
+                                <div id="file-upload" class="mt-1 flex justify-center px-6 pt-5 pb-6 border-2 border-gray-300 border-dashed rounded-md">
+                                    <div class="space-y-1 text-center">
+                                        <svg class="mx-auto h-12 w-12 text-gray-400" stroke="currentColor" fill="none" viewBox="0 0 48 48" aria-hidden="true">
+                                            <path d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                                        </svg>
+                                        <div class="flex text-sm text-gray-600">
+                                            <label for="file-upload-input" class="relative cursor-pointer bg-white rounded-md font-medium text-indigo-600 hover:text-indigo-500 focus-within:outline-none focus-within:ring-2 focus-within:ring-offset-2 focus-within:ring-indigo-500">
+                                                <span>Upload a file</span>
+                                                <input id="file-upload-input" type="file" name="attachments[]" class="sr-only" multiple>
+                                            </label>
+                                            <p class="pl-1">or drag and drop</p>
+                                        </div>
+                                        <p class="text-xs text-gray-500">PDF, DOC, JPG, PNG up to 10MB</p>
+                                    </div>
+                                </div>
+                                <div id="attachments-preview" class="mt-2 hidden">
+                                    <h4 class="text-sm font-medium text-gray-700">Attachments:</h4>
+                                    <ul id="attachments-list-preview" class="mt-1 space-y-1">
+                                        <!-- Attachments will be listed here -->
+                                    </ul>
+                                </div>
+                            </div>
+                        </form>
+                    </div>
+                    <div class="flex justify-between items-center gap-x-2 py-3 px-4 border-t">
+                        <div>
+                            <button type="button" onclick="saveAsDraft()" class="py-2 px-3 inline-flex items-center gap-x-2 text-sm font-medium rounded-lg border border-gray-200 bg-white text-gray-800 shadow-sm hover:bg-gray-50 disabled:opacity-50 disabled:pointer-events-none">
+                                Save Draft
+                            </button>
+                        </div>
+                        <div class="flex items-center gap-x-2">
+                            <button type="button" onclick="hideComposeModal()" class="py-2 px-3 inline-flex items-center gap-x-2 text-sm font-medium rounded-lg border border-gray-200 bg-white text-gray-800 shadow-sm hover:bg-gray-50 disabled:opacity-50 disabled:pointer-events-none">
+                                Discard
+                            </button>
+                            <button type="button" onclick="sendEmail()" class="py-2 px-3 inline-flex items-center gap-x-2 text-sm font-semibold rounded-lg border border-transparent bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 disabled:pointer-events-none">
+                                Send
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Current state
+        let currentFolder = 'inbox';
+        let currentEmail = null;
+        let attachments = [];
+        let emailList = [];
+
+        // Initialize the app
+        $(document).ready(function() {
+            setupEventListeners();
+            
+            <?php if ($loggedIn): ?>
+                loadInbox();
+            <?php endif; ?>
+        });
+
+        function setupEventListeners() {
+            // Auth form submission
+            $('#auth-form').on('submit', function(e) {
+                e.preventDefault();
+                const action = $('#auth-action').val();
+                
+                if (action === 'login') {
+                    handleLogin();
+                } else {
+                    handleSignup();
+                }
+            });
+
+            // File upload handling
+            $('#file-upload-input').on('change', function(e) {
+                handleFileUpload(e.target.files);
+            });
+
+            // Drag and drop for files
+            $('#file-upload').on('dragover', function(e) {
+                e.preventDefault();
+                $(this).addClass('border-indigo-500 bg-indigo-50');
+            });
+
+            $('#file-upload').on('dragleave', function(e) {
+                e.preventDefault();
+                $(this).removeClass('border-indigo-500 bg-indigo-50');
+            });
+
+            $('#file-upload').on('drop', function(e) {
+                e.preventDefault();
+                $(this).removeClass('border-indigo-500 bg-indigo-50');
+                if (e.originalEvent.dataTransfer.files.length) {
+                    handleFileUpload(e.originalEvent.dataTransfer.files);
+                }
+            });
+
+            // Prevent default behavior for all anchor tags
+            $('a').on('click', function(e) {
+                e.preventDefault();
+            });
+        }
+
+        function handleLogin() {
+            const email = $('#email').val();
+            const password = $('#password').val();
+            const rememberMe = $('#remember-me').is(':checked');
+
+            if (!email || !password) {
+                alert('Please enter both email and password');
+                return;
+            }
+
+            $.ajax({
+                url: '?api=login',
+                type: 'POST',
+                data: {
+                    action: 'login',
+                    email: email,
+                    password: password
+                },
+                success: function(response) {
+                    if (response.success) {
+                        // Reload the page to show the app
+                        window.location.reload();
+                    } else {
+                        alert(response.message || 'Login failed');
+                    }
+                },
+                error: function() {
+                    alert('Error connecting to server');
+                }
+            });
+        }
+
+        function handleSignup() {
+            const name = $('#name').val();
+            const email = $('#email').val();
+            const password = $('#password').val();
+
+            if (!name || !email || !password) {
+                alert('Please fill in all fields');
+                return;
+            }
+
+            $.ajax({
+                url: '?api=signup',
+                type: 'POST',
+                data: {
+                    action: 'signup',
+                    name: name,
+                    email: email,
+                    password: password
+                },
+                success: function(response) {
+                    if (response.success) {
+                        // Reload the page to show the app
+                        window.location.reload();
+                    } else {
+                        alert(response.message || 'Signup failed');
+                    }
+                },
+                error: function() {
+                    alert('Error connecting to server');
+                }
+            });
+        }
+
+        function logout() {
+            $.ajax({
+                url: '?api=logout',
+                type: 'POST',
+                success: function() {
+                    window.location.reload();
+                },
+                error: function() {
+                    alert('Error logging out');
+                }
+            });
+        }
+
+        function loadInbox() {
+            currentFolder = 'inbox';
+            $('#folder-name').text('Inbox');
+            loadEmails();
+        }
+
+        function loadSent() {
+            currentFolder = 'sent';
+            $('#folder-name').text('Sent');
+            loadEmails();
+        }
+
+        function loadDrafts() {
+            currentFolder = 'drafts';
+            $('#folder-name').text('Drafts');
+            loadEmails();
+        }
+
+        function loadTrash() {
+            currentFolder = 'trash';
+            $('#folder-name').text('Trash');
+            loadEmails();
+        }
+
+        function loadEmails() {
+            $.ajax({
+                url: '?api=emails',
+                type: 'GET',
+                data: {
+                    folder: currentFolder
+                },
+                success: function(response) {
+                    if (response.success) {
+                        emailList = response.emails;
+                        renderEmailList(emailList);
+                        updateCounts();
+                    } else {
+                        alert(response.message || 'Error loading emails');
+                    }
+                },
+                error: function() {
+                    alert('Error connecting to server');
+                }
+            });
+        }
+
+        function renderEmailList(emails) {
+            const $emailList = $('#email-list');
+            $emailList.empty();
+
+            if (emails.length === 0) {
+                $emailList.append(`
+                    <div class="p-8 text-center text-gray-500">
+                        <i class="fas fa-inbox text-4xl mb-2"></i>
+                        <p>No emails in this folder</p>
+                    </div>
+                `);
+                $('#email-count').text('0');
+                $('#total-emails').text('0');
+                return;
+            }
+
+            emails.forEach(email => {
+                const isUnread = currentFolder === 'inbox' && !email.is_read;
+                const fromOrTo = currentFolder === 'sent' ? `To: ${email.to_name || email.recipient_id}` : `From: ${email.from_name || email.sender_id}`;
+                
+                $emailList.append(`
+                    <div class="email-item flex items-center px-4 py-3 hover:bg-gray-50 cursor-pointer ${isUnread ? 'unread' : ''}" onclick="viewEmail(${email.id})" data-id="${email.id}">
+                        <div class="flex items-center min-w-0 flex-1">
+                            <div class="min-w-0 flex-1 px-4">
+                                <div class="flex justify-between">
+                                    <p class="email-subject text-sm font-medium ${isUnread ? 'text-gray-900' : 'text-gray-600'} truncate">${email.subject || '(No subject)'}</p>
+                                    <p class="text-xs ${isUnread ? 'text-gray-900' : 'text-gray-500'}">${formatDate(email.created_at)}</p>
+                                </div>
+                                <p class="text-sm ${isUnread ? 'text-gray-900 font-medium' : 'text-gray-500'} truncate">${fromOrTo}</p>
+                                <p class="text-sm text-gray-500 truncate">${email.content ? email.content.substring(0, 50) + (email.content.length > 50 ? '...' : '') : '(No content)'}</p>
+                            </div>
+                        </div>
+                    </div>
+                `);
+            });
+
+            $('#email-count').text(`1-${emails.length}`);
+            $('#total-emails').text(emails.length);
+        }
+
+        function viewEmail(id) {
+            const email = emailList.find(e => e.id == id);
+            if (!email) return;
+
+            currentEmail = email;
+
+            // Mark as read if in inbox
+            if (currentFolder === 'inbox' && !email.is_read) {
+                $.ajax({
+                    url: '?api=emails',
+                    type: 'POST',
+                    data: {
+                        action: 'mark_read',
+                        email_id: id
+                    },
+                    success: function() {
+                        // Update the UI
+                        $(`.email-item[data-id="${id}"]`).removeClass('unread');
+                        $(`.email-item[data-id="${id}"] .email-subject`).removeClass('text-gray-900').addClass('text-gray-600');
+                        updateUnreadCount();
+                    }
+                });
+            }
+
+            $('#email-view').removeClass('hidden');
+            $('#email-subject').text(email.subject || '(No subject)');
+            
+            if (currentFolder === 'sent') {
+                $('#sender-name').text('Me');
+                $('#sender-email').text('');
+                $('#sender-avatar').attr('src', 'https://ui-avatars.com/api/?name=Me&background=random');
+                $('#email-to').text(`To: ${email.to_name || email.recipient_id}`);
+            } else {
+                $('#sender-name').text(email.from_name || email.sender_id);
+                $('#sender-email').text(email.from_email || '');
+                $('#sender-avatar').attr('src', `https://ui-avatars.com/api/?name=${encodeURIComponent(email.from_name || '')}&background=random`);
+                $('#email-to').text(`From: ${email.from_name || email.sender_id}`);
+            }
+            
+            $('#email-date').text(formatDate(email.created_at, true));
+            
+            if (email.cc) {
+                $('#email-cc').text(`Cc: ${email.cc}`).removeClass('hidden');
+            } else {
+                $('#email-cc').addClass('hidden');
+            }
+            
+            $('#email-body').html(email.content ? email.content.replace(/\n/g, '<br>') : '(No content)');
+            
+            const $attachmentsList = $('#attachments-list');
+            $attachmentsList.empty();
+            
+            if (email.attachments && email.attachments.length > 0) {
+                $('#email-attachments').removeClass('hidden');
+                email.attachments.forEach(attachment => {
+                    let iconClass = 'fa-file';
+                    const fileType = attachment.file_type.split('/')[0];
+                    
+                    if (fileType === 'application' && attachment.file_name.endsWith('.pdf')) {
+                        iconClass = 'fa-file-pdf';
+                    } else if (fileType === 'application' && (attachment.file_name.endsWith('.doc') || attachment.file_name.endsWith('.docx'))) {
+                        iconClass = 'fa-file-word';
+                    } else if (fileType === 'application' && (attachment.file_name.endsWith('.xls') || attachment.file_name.endsWith('.xlsx'))) {
+                        iconClass = 'fa-file-excel';
+                    } else if (fileType === 'image') {
+                        iconClass = 'fa-file-image';
+                    }
+                    
+                    const fileSize = (attachment.file_size / (1024 * 1024)).toFixed(2) + ' MB';
+                    
+                    $attachmentsList.append(`
+                        <li class="flex items-center justify-between py-3">
+                            <div class="flex items-center">
+                                <i class="fas ${iconClass} text-gray-500 mr-3"></i>
+                                <span class="text-sm font-medium text-gray-900">${attachment.file_name}</span>
+                            </div>
+                            <div class="flex items-center">
+                                <span class="text-xs text-gray-500 mr-3">${fileSize}</span>
+                                <a href="download.php?id=${attachment.id}" class="text-indigo-600 hover:text-indigo-900 text-sm font-medium">
+                                    Download
+                                </a>
+                            </div>
+                        </li>
+                    `);
+                });
+            } else {
+                $('#email-attachments').addClass('hidden');
+            }
+        }
+
+        function showComposeModal() {
+            $('#compose-modal').removeClass('hidden');
+            $('#to').focus();
+        }
+
+        function hideComposeModal() {
+            $('#compose-modal').addClass('hidden');
+            resetComposeForm();
+        }
+
+        function resetComposeForm() {
+            $('#compose-form')[0].reset();
+            $('#cc-field').addClass('hidden');
+            $('#bcc-field').addClass('hidden');
+            attachments = [];
+            updateAttachmentsPreview();
+        }
+
+        function toggleCc() {
+            $('#cc-field').toggleClass('hidden');
+            if (!$('#cc-field').hasClass('hidden')) {
+                $('#cc').focus();
+            }
+        }
+
+        function toggleBcc() {
+            $('#bcc-field').toggleClass('hidden');
+            if (!$('#bcc-field').hasClass('hidden')) {
+                $('#bcc').focus();
+            }
+        }
+
+        function handleFileUpload(files) {
+            attachments = Array.from(files);
+            updateAttachmentsPreview();
+        }
+
+        function updateAttachmentsPreview() {
+            const $previewList = $('#attachments-list-preview');
+            $previewList.empty();
+
+            if (attachments.length === 0) {
+                $('#attachments-preview').addClass('hidden');
+                return;
+            }
+
+            $('#attachments-preview').removeClass('hidden');
+
+            attachments.forEach((file, index) => {
+                const fileType = file.name.split('.').pop().toLowerCase();
+                let iconClass = 'fa-file';
+
+                if (fileType === 'pdf') {
+                    iconClass = 'fa-file-pdf';
+                } else if (['doc', 'docx'].includes(fileType)) {
+                    iconClass = 'fa-file-word';
+                } else if (['xls', 'xlsx'].includes(fileType)) {
+                    iconClass = 'fa-file-excel';
+                } else if (['jpg', 'jpeg', 'png', 'gif'].includes(fileType)) {
+                    iconClass = 'fa-file-image';
+                }
+
+                const fileSize = (file.size / (1024 * 1024)).toFixed(2) + ' MB';
+
+                $previewList.append(`
+                    <li class="flex items-center justify-between py-1 px-2 bg-gray-50 rounded">
+                        <div class="flex items-center">
+                            <i class="fas ${iconClass} text-gray-500 mr-2"></i>
+                            <span class="text-sm text-gray-700 truncate max-w-xs">${file.name}</span>
+                        </div>
+                        <div class="flex items-center">
+                            <span class="text-xs text-gray-500 mr-2">${fileSize}</span>
+                            <button onclick="removeAttachment(${index})" class="text-gray-400 hover:text-gray-600">
+                                <i class="fas fa-times"></i>
+                            </button>
+                        </div>
+                    </li>
+                `);
+            });
+        }
+
+        function removeAttachment(index) {
+            attachments.splice(index, 1);
+            updateAttachmentsPreview();
+        }
+
+        function sendEmail() {
+            const formData = new FormData($('#compose-form')[0]);
+            formData.append('action', 'send');
+            
+            // Add attachments to the form data
+            attachments.forEach((file, index) => {
+                formData.append(`attachments[${index}]`, file);
+            });
+
+            $.ajax({
+                url: '?api=emails',
+                type: 'POST',
+                data: formData,
+                processData: false,
+                contentType: false,
+                success: function(response) {
+                    if (response.success) {
+                        hideComposeModal();
+                        loadSent();
+                    } else {
+                        alert(response.message || 'Error sending email');
+                    }
+                },
+                error: function() {
+                    alert('Error connecting to server');
+                }
+            });
+        }
+
+        function saveAsDraft() {
+            const formData = new FormData($('#compose-form')[0]);
+            formData.append('action', 'save_draft');
+            
+            // Add attachments to the form data
+            attachments.forEach((file, index) => {
+                formData.append(`attachments[${index}]`, file);
+            });
+
+            $.ajax({
+                url: '?api=emails',
+                type: 'POST',
+                data: formData,
+                processData: false,
+                contentType: false,
+                success: function(response) {
+                    if (response.success) {
+                        hideComposeModal();
+                        loadDrafts();
+                        updateDraftsCount();
+                    } else {
+                        alert(response.message || 'Error saving draft');
+                    }
+                },
+                error: function() {
+                    alert('Error connecting to server');
+                }
+            });
+        }
+
+        function replyEmail() {
+            if (!currentEmail) return;
+            
+            showComposeModal();
+            $('#subject').val(`Re: ${currentEmail.subject}`);
+            $('#to').val(currentFolder === 'sent' ? currentEmail.recipient_id : currentEmail.sender_id);
+            $('#email-content').val(`\n\n-------- Original Message --------\nFrom: ${currentEmail.from_name || currentEmail.sender_id}\nDate: ${formatDate(currentEmail.created_at, true)}\nSubject: ${currentEmail.subject}\n\n${currentEmail.content ? currentEmail.content.replace(/<[^>]*>/g, '') : ''}`);
+        }
+
+        function forwardEmail() {
+            if (!currentEmail) return;
+            
+            showComposeModal();
+            $('#subject').val(`Fwd: ${currentEmail.subject}`);
+            $('#email-content').val(`\n\n-------- Forwarded Message --------\nFrom: ${currentEmail.from_name || currentEmail.sender_id}\nDate: ${formatDate(currentEmail.created_at, true)}\nSubject: ${currentEmail.subject}\n\n${currentEmail.content ? currentEmail.content.replace(/<[^>]*>/g, '') : ''}`);
+        }
+
+        function deleteEmail() {
+            if (!currentEmail) return;
+            
+            if (confirm('Are you sure you want to delete this email?')) {
+                $.ajax({
+                    url: '?api=emails',
+                    type: 'POST',
+                    data: {
+                        action: 'delete',
+                        email_id: currentEmail.id
+                    },
+                    success: function(response) {
+                        if (response.success) {
+                            loadFolder(currentFolder);
+                            $('#email-view').addClass('hidden');
+                        } else {
+                            alert(response.message || 'Error deleting email');
+                        }
+                    },
+                    error: function() {
+                        alert('Error connecting to server');
+                    }
+                });
+            }
+        }
+
+        function updateCounts() {
+            updateUnreadCount();
+            updateDraftsCount();
+        }
+
+        function updateUnreadCount() {
+            $.ajax({
+                url: '?api=emails',
+                type: 'GET',
+                data: {
+                    folder: 'inbox',
+                    count_only: true
+                },
+                success: function(response) {
+                    if (response.success) {
+                        $('#inbox-count').text(response.unread_count > 0 ? response.unread_count : '');
+                    }
+                }
+            });
+        }
+
+        function updateDraftsCount() {
+            $.ajax({
+                url: '?api=emails',
+                type: 'GET',
+                data: {
+                    folder: 'drafts',
+                    count_only: true
+                },
+                success: function(response) {
+                    if (response.success) {
+                        $('#drafts-count').text(response.drafts_count > 0 ? response.drafts_count : '');
+                    }
+                }
+            });
+        }
+
+        function formatDate(dateString, includeTime = false) {
+            const date = new Date(dateString);
+            const options = { year: 'numeric', month: 'short', day: 'numeric' };
+            if (includeTime) {
+                options.hour = '2-digit';
+                options.minute = '2-digit';
+            }
+            return date.toLocaleDateString('en-US', options);
+        }
+    </script>
+</body>
+</html>

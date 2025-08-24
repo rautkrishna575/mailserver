@@ -1,0 +1,45 @@
+/* /assets/css/style.css */
+.file-upload {
+    transition: all 0.3s ease;
+}
+.file-upload.drag-over {
+    border-color: #6366f1;
+    background-color: #eef2ff;
+}
+.email-item.unread {
+    background-color: #eff6ff;
+}
+.email-item.unread .email-subject {
+    font-weight: 600;
+    color: #1f2937;
+} 
+
+ .recipient-pill {
+            display: inline-flex;
+            align-items: center;
+            background-color: #e0e7ff; /* indigo-100 */
+            color: #4338ca; /* indigo-800 */
+            border-radius: 9999px;
+            padding: 2px 8px;
+            margin: 2px;
+            font-size: 0.875rem;
+            font-weight: 500;
+        }
+        .recipient-pill .remove-pill {
+            margin-left: 6px;
+            cursor: pointer;
+            opacity: 0.7;
+        }
+        .recipient-pill .remove-pill:hover {
+            opacity: 1;
+        }
+        .recipient-input {
+            flex-grow: 1;
+            border: none;
+            outline: none;
+            padding: 6px 0;
+            background: transparent;
+        }
+        .recipient-container:focus-within {
+            border-color: #6366f1; /* indigo-500 */
+        }
