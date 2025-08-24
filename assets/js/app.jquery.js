@@ -151,7 +151,7 @@ $(document).ready(function () {
       action === "signup" &&
       $("#signup-password").val() !== $("#confirm-password").val()
     ) {
-      alert("Passwords do not match.");
+      toastr.error("Passwords do not match.");
       return;
     }
     const $button = $form.find('button[type="submit"]');
@@ -161,7 +161,8 @@ $(document).ready(function () {
       .call(action, formData, "POST")
       .done((response) => {
         if (response.success) window.location.reload();
-        else alert(response.message || "An error occurred.");
+        else
+          toastr.error(response.message || "Authentication failed.");
       })
       .fail(() => alert("Could not connect to the server."))
       .always(() => {
