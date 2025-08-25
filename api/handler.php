@@ -3,8 +3,17 @@
 session_start();
 header('Content-Type: application/json');
 
+//for mailer
+require_once __DIR__ . '/../vendor/autoload.php';
+
 require_once '../config.php';
 require_once '../src/Database.php';
+
+// Add PHPMailer use statements at the top
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\Exception;
+// use PHPMailer\PHPMailer\SMTP;
+
 
 $pdo = Database::getInstance()->getConnection();
 
@@ -37,9 +46,9 @@ function verifyToken($pdo, $userId, $token)
 // =========================================================================
 $response = ['success' => false, 'message' => 'Invalid Request'];
 $action = $_REQUEST['action'] ?? '';
-$protectedActions = ['emails', 'logout', 'counts', 'search_users'];
+$protectedActions = ['emails', 'logout', 'counts', 'search_users', 'forgot_password'];
 if (in_array($action, $protectedActions)) {
-    if (!verifyToken($pdo, $_SESSION['user_id'] ?? null, $_SESSION['token'] ?? null)) {
+    if ((!verifyToken($pdo, $_SESSION['user_id'] ?? null, $_SESSION['token'] ?? null)) && $action != 'forgot_password') {
         http_response_code(401);
         echo json_encode(['success' => false, 'message' => 'Unauthorized']);
         exit;
@@ -114,6 +123,117 @@ try {
             $stmt->execute(["%$term%", "%$term%", $userId]);
             $response = ['success' => true, 'users' => $stmt->fetchAll()];
             break;
+        case 'forgot_password':
+            $email = filter_var($_POST['email'], FILTER_VALIDATE_EMAIL);
+            if (!$email) {
+                throw new Exception("Invalid email format provided.");
+            }
+
+            // 1. Check if the user's email exists
+            $stmt = $pdo->prepare("SELECT id, name FROM users WHERE email = ?");
+            $stmt->execute([$email]);
+            $user = $stmt->fetch();
+
+            if ($user) {
+                // 2. Generate a secure, 6-digit OTP
+                $otp = random_int(100000, 999999);
+                $otp_expiry = new DateTime('+5 minutes'); // OTP will be valid for 5 minutes
+
+                // 3. Securely store a hash of the OTP and its expiry in the database
+                $stmt_update = $pdo->prepare("UPDATE users SET reset_otp = ?, reset_otp_expiry = ? WHERE id = ?");
+                $stmt_update->execute([password_hash($otp, PASSWORD_DEFAULT), $otp_expiry->format('Y-m-d H:i:s'), $user['id']]);
+
+                // 4. Send the OTP to the user's email using PHPMailer
+                $mail = new PHPMailer(true);
+                try {
+                    // Server settings
+                    // $mail->SMTPDebug = SMTP::DEBUG_SERVER;
+                    $mail->isSMTP();
+                    $mail->Host       = SMTP_HOST;
+                    $mail->SMTPAuth   = true;
+                    $mail->Username   = SMTP_USERNAME;
+                    $mail->Password   = SMTP_PASSWORD;
+                    $mail->SMTPSecure = SMTP_SECURE;
+                    $mail->Port       = SMTP_PORT;
+
+
+                    // Recipients
+                    $mail->setFrom(MAIL_FROM_ADDRESS, MAIL_FROM_NAME);
+                    $mail->addAddress($email, $user['name']); // Add a recipient
+
+                    // Email Content
+                    $mail->isHTML(true);
+                    $mail->Subject = 'Your Password Reset Code';
+                    $mail->Body    = "
+                                    <div style='font-family: sans-serif; padding: 20px; color: #333;'>
+                                        <h2>Password Reset Request</h2>
+                                        <p>Hi {$user['name']},</p>
+                                        <p>Use the code below to reset your password. This code is valid for 5 minutes.</p>
+                                        <p style='font-size: 24px; font-weight: bold; letter-spacing: 5px; background: #f0f0f0; padding: 10px 20px; border-radius: 5px; text-align: center;'>
+                                            {$otp}
+                                        </p>
+                                        <p>If you did not request a password reset, you can safely ignore this email.</p>
+                                    </div>
+                                ";
+                    $mail->AltBody = "Your password reset code is: {$otp}. It is valid for 15 minutes.";
+                    $mail->send();
+                    $response = ['success' => true, 'message' => 'A password reset code has been sent to your email.'];
+                } catch (Exception $e) {
+                    // Log the detailed error for debugging purposes, but show a generic error to the user
+                    error_log("PHPMailer Error: " . $mail->ErrorInfo);
+                    echo $mail->ErrorInfo;
+                    throw new Exception(" The email could not be sent. Please try again later.");
+                }
+            } else {
+                // For security, always return a success message to prevent user enumeration attacks.
+                $response = ['success' => true, 'message' => 'If an account with that email exists, a reset code has been sent.'];
+            }
+            break;
+        case 'reset_password':
+            $email = filter_var($_POST['email'], FILTER_VALIDATE_EMAIL);
+            $otp = preg_replace('/[^0-9]/', '', $_POST['otp']); // Sanitize OTP
+            $new_password = $_POST['new_password'];
+
+            if (!$email || strlen($otp) !== 6 || empty($new_password)) {
+                throw new Exception("Invalid data provided. Please check your inputs.");
+            }
+
+            // 1. Find the user and their stored OTP hash
+            $stmt = $pdo->prepare("SELECT id, reset_otp, reset_otp_expiry FROM users WHERE email = ?");
+            $stmt->execute([$email]);
+            $user = $stmt->fetch();
+
+            if (!$user || !$user['reset_otp']) {
+                throw new Exception("No pending password reset found for this email.");
+            }
+
+            // 2. Check if the OTP has expired
+            $expiry_time = new DateTime($user['reset_otp_expiry']);
+            $current_time = new DateTime();
+            if ($current_time > $expiry_time) {
+                // For security, clear the expired OTP from the database
+                $pdo->prepare("UPDATE users SET reset_otp = NULL, reset_otp_expiry = NULL WHERE id = ?")->execute([$user['id']]);
+                throw new Exception("The code has expired. Please request a new one.");
+            }
+
+            // 3. Verify the OTP against the stored hash
+            if (!password_verify($otp, $user['reset_otp'])) {
+                throw new Exception("The code you entered is incorrect.");
+            }
+
+            // 4. If all checks pass, hash the new password and update the database
+            $new_password_hash = password_hash($new_password, PASSWORD_BCRYPT);
+
+            // 5. Update password and, CRUCIALLY, clear the OTP fields to prevent reuse
+            $stmt_update = $pdo->prepare("UPDATE users SET password = ?, reset_otp = NULL, reset_otp_expiry = NULL WHERE id = ?");
+            $stmt_update->execute([$new_password_hash, $user['id']]);
+
+            $response = ['success' => true, 'message' => 'Password has been reset successfully. You can now log in.'];
+            break;
+
+
+
+
 
         // --- EMAIL ACTIONS ---
         case 'emails':

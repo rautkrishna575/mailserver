@@ -45,6 +45,10 @@ $(document).ready(function () {
       $("#login-tab, #signup-tab").on("click", toggleAuthForm);
       $("#login-form, #signup-form").on("submit", handleAuthSubmit);
       $("#signup-password, #confirm-password").on("keyup", checkPasswordMatch);
+      $("#forgot-password-link").on("click", showForgotPasswordModal);
+      $("#back-to-login-link").on("click", hideForgotPasswordModal);
+      $("#forgot-password-form").on("submit", handleForgotPasswordSubmit);
+      $("#reset-password-form").on("submit", handleResetPasswordSubmit);
     }
     if ($("#app-container").length) {
       $("#sidebar-nav").on("click", ".sidebar-link", handleFolderChange);
@@ -104,6 +108,90 @@ $(document).ready(function () {
       loadEmails("inbox");
       updateCounts();
     }
+  }
+
+  function showForgotPasswordModal(e) {
+    e.preventDefault();
+    $("#forgot-password-modal").removeClass("hidden");
+  }
+
+  function hideForgotPasswordModal(e) {
+    if (e) e.preventDefault();
+    $("#forgot-password-modal").addClass("hidden");
+
+    // Reset both forms to their initial state
+    $("#forgot-password-form")[0].reset();
+    $("#reset-password-form")[0].reset();
+
+    // Ensure the first view is shown next time
+    $('#send-otp-view').removeClass('hidden');
+    $('#reset-password-view').addClass('hidden');
+  }
+
+  function handleResetPasswordSubmit(e) {
+    e.preventDefault();
+    const $form = $(this);
+    const formData = new FormData(this);
+    const $button = $form.find('button[type="submit"]');
+
+    // Client-side validation for matching passwords
+    const newPassword = $('#reset-new-password').val();
+    const confirmPassword = $('#reset-confirm-password').val();
+
+    if (newPassword !== confirmPassword) {
+      toastr.error("The new passwords do not match.");
+      return;
+    }
+
+    $button.prop("disabled", true).find(".auth-submit-text").addClass("hidden");
+    $button.find(".auth-spinner").removeClass("hidden");
+
+    api.call("reset_password", formData, "POST")
+      .done((response) => {
+        if (response.success) {
+          toastr.success(response.message);
+          hideForgotPasswordModal(); // Close the modal on final success
+        } else {
+          toastr.error(response.message || "Could not reset password.");
+        }
+      })
+      .fail(() => toastr.error("Could not connect to the server."))
+      .always(() => {
+        $button.prop("disabled", false).find(".auth-submit-text").removeClass("hidden");
+        $button.find(".auth-spinner").addClass("hidden");
+      });
+  }
+
+
+  function handleForgotPasswordSubmit(e) {
+    e.preventDefault();
+    const $form = $(this);
+    const formData = new FormData(this);
+    const $button = $form.find('button[type="submit"]');
+
+    $button.prop("disabled", true).find(".auth-submit-text").addClass("hidden");
+    $button.find(".auth-spinner").removeClass("hidden");
+
+    api.call("forgot_password", formData, "POST")
+      .done((response) => {
+        if (response.success) {
+          toastr.success(response.message || "A reset code has been sent.");
+          // --- SWITCH THE VIEW ---
+          // 1. Hide the OTP sending form
+          $('#send-otp-view').addClass('hidden');
+          // 2. Show the password reset form
+          $('#reset-password-view').removeClass('hidden');
+          // 3. Carry the email over to the hidden field in the new form
+          $('#reset-email').val($('#forgot-email').val());
+        } else {
+          toastr.error(response.message || "Could not process your request.");
+        }
+      })
+      .fail(() => toastr.error("Could not connect to the server."))
+      .always(() => {
+        $button.prop("disabled", false).find(".auth-submit-text").removeClass("hidden");
+        $button.find(".auth-spinner").addClass("hidden");
+      });
   }
 
   // --- Authentication Functions ---
